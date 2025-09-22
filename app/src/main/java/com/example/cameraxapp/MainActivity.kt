@@ -4,6 +4,7 @@ import androidx.appcompat.app.AppCompatActivity
 import android.Manifest
 import android.content.ContentValues
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -96,22 +97,24 @@ class MainActivity : AppCompatActivity() {
 
     private fun onPush() {
         Log.i(TAG, "onPush() $recording")
-        if (recording == null) {
-            Log.i(TAG, "Starting a new recording")
-            captureVideo()
-        } else if (!is_recording) {
-            Log.i(TAG, "Resuming recording $recording")
-            recording?.resume()
-        }
+//        if (recording == null) {
+//            Log.i(TAG, "Starting a new recording")
+//            captureVideo()
+//        } else if (!is_recording) {
+//            Log.i(TAG, "Resuming recording $recording")
+//            recording?.resume()
+//        }
+        captureVideoSegment();
     }
 
     private fun onRelease() {
         Log.i(TAG, "Pausing recording $recording")
-        if (is_recording)
-            recording?.pause()
+//        if (is_recording)
+//            recording?.pause()
+        stopRunnable.run()
     }
 
-    // Implements VideoCapture use case, including start and stop capturing.
+    // Implements VideoCapture use case to a single file, including start and stop capturing.
     private fun captureVideo() {
         val videoCapture = this.videoCapture ?: return
 
@@ -190,6 +193,57 @@ class MainActivity : AppCompatActivity() {
                 }
             }
     }
+
+    private val segmentUris = mutableListOf<Uri>()
+
+    //    Different approach, we capture into multiple video files, one for each segment
+    private fun captureVideoSegment() {
+        val vc = videoCapture ?: return
+        val name = "segment_${System.currentTimeMillis()}"
+        val contentValues = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+            put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
+        }
+        val outputOptions = MediaStoreOutputOptions.Builder(
+            contentResolver, MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+        ).setContentValues(contentValues).build()
+
+        recording = vc.output
+            .prepareRecording(this, outputOptions)
+            .apply {
+                if (PermissionChecker.checkSelfPermission(this@MainActivity,
+                        Manifest.permission.RECORD_AUDIO) ==
+                    PermissionChecker.PERMISSION_GRANTED)
+                {
+                    withAudioEnabled()
+                }
+            }
+            .start(ContextCompat.getMainExecutor(this)) { event ->
+                if (event is VideoRecordEvent.Start) {
+                    is_recording = true;
+
+                    segmentStartTime = System.currentTimeMillis()
+                    viewBinding.root.removeCallbacks(stopRunnable)
+//                    viewBinding.root.postDelayed(stopRunnable, maxDuration)
+
+    //                        viewBinding.videoCaptureButton.apply {text = "Started"}
+                } else if (event is VideoRecordEvent.Finalize) {
+                    if (!event.hasError()) {
+                        val msg = "Video capture succeeded: ${event.outputResults.outputUri}"
+                        Toast.makeText(baseContext, msg, Toast.LENGTH_SHORT)
+                            .show()
+                        Log.i(TAG, msg)
+//                            viewBinding.videoCaptureButton.apply {text = "Succeeded"}
+                    } else {
+                        Log.e(TAG, "Video capture ends with error: " +
+                                "${event.error}")
+//                            viewBinding.videoCaptureButton.apply {text = "Failed"}
+                    }
+                    segmentUris.add(event.outputResults.outputUri)
+                }
+            }
+    }
+
 
     private fun startCamera() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
