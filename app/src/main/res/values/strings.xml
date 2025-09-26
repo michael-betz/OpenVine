@@ -5,4 +5,5 @@
     <string name="stop_capture">Stop Capture</string>
     <string name="pause_capture">Pause Capture</string>
     <string name="resume_capture">Resume Capture</string>
+    <string name="switch_camera">Switch</string>
 </resources>
