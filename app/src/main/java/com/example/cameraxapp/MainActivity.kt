@@ -2,13 +2,15 @@ package com.example.cameraxapp
 
 import android.Manifest
 import android.annotation.SuppressLint
-import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.media.*
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.MotionEvent
 import android.view.Surface
@@ -20,18 +22,20 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
+import com.example.cameraxapp.ui.ProgressRingView
 import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : AppCompatActivity() {
     private val TAG = "OpenVine"
-
     private enum class CamState {
+        STITCH, // All segments recorded, stitch them together
         IDLE,
-        RECORDING_SEGMENT,
-        WAITING_FOR_NEXT_RECORDING,
-        ALL_SEGMENTS_RECORDED
+        RECORDING,
+        FINISHING, // User has requested stop, but we must wait for the last frame to be encoded
+
     }
 
     private var camState: CamState = CamState.IDLE
@@ -39,6 +43,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var textureView: TextureView
     private lateinit var recordButton: View
     private lateinit var switchButton: Button
+    private lateinit var progressRing: ProgressRingView
     // Camera2
     private var cameraDevice: android.hardware.camera2.CameraDevice? = null
     private var captureSession: android.hardware.camera2.CameraCaptureSession? = null
@@ -50,17 +55,18 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var encoder: MediaCodec? = null
     private var encoderSurface: Surface? = null
     private val encoderExecutor = Executors.newSingleThreadExecutor()
+    private val stitchingExecutor = Executors.newSingleThreadExecutor()
     @Volatile private var encoderOutputFormat: MediaFormat? = null
 
     // Muxer related (per-segment)
     @Volatile private var muxer: MediaMuxer? = null
     private var muxerTrackIndex = -1
-    @Volatile private var muxerStarted = false
     private var segmentStartPtsUs: Long = 0L
-    private val writingSegment = AtomicBoolean(false)
+    private var lastSegmentLengthUs: Long = 0L
+    private var segmentLengthUs: Long = 0L
     private val segmentFiles = mutableListOf<String>()
-    private var allRecordedTime: Long = 0L
-    private var maxDuration: Long = 6000L
+    private var allRecordedTimeUs: Long = 0L
+    private var maxDurationUs: Long = 6000000L
     
     // Encoding loop control
     private val encoderLoopRunning = AtomicBoolean(false)
@@ -68,8 +74,8 @@ class MainActivity : AppCompatActivity() {
     // Desired video params
     private val WIDTH = 1280
     private val HEIGHT = 720
-    private val FPS = 30
-    private val BITRATE = 4_000_000
+    private val FPS = 60
+    private val BITRATE = 32_000_000
 
     // Permissions
     private val permissionsLauncher = registerForActivityResult(
@@ -80,7 +86,6 @@ class MainActivity : AppCompatActivity() {
         else Toast.makeText(this, "Permissions required", Toast.LENGTH_SHORT).show()
     }
 
-    @SuppressLint("ServiceCast")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
@@ -88,8 +93,9 @@ class MainActivity : AppCompatActivity() {
         textureView = findViewById(R.id.viewFinder)
         recordButton = findViewById(R.id.video_capture_button)
         switchButton = findViewById(R.id.switch_camera_button)
+        progressRing = findViewById(R.id.progressRing)
 
-        var cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        val cameraManager = getSystemService(CAMERA_SERVICE) as CameraManager
 
         for (id in cameraManager.cameraIdList) {
             val characteristics = cameraManager.getCameraCharacteristics(id)
@@ -124,6 +130,15 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // update progress ring continuously
+        val handler = Handler(Looper.getMainLooper())
+        handler.post(object : Runnable {
+            override fun run() {
+                progressRing.progress = allRecordedTimeUs.toFloat() / maxDurationUs
+                handler.postDelayed(this, 16) // ~60fps
+            }
+        })
+
         if (!allPermissionsGranted()) {
             permissionsLauncher.launch(arrayOf(Manifest.permission.CAMERA))
         } else {
@@ -145,7 +160,6 @@ class MainActivity : AppCompatActivity() {
             override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean { return true }
             override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
         }
-        if (textureView.isAvailable) openCameraAndStartEncoder()
     }
 
     private fun openCameraAndStartEncoder() {
@@ -174,16 +188,19 @@ class MainActivity : AppCompatActivity() {
 
         // Start loop that drains encoder output continuously.
         camState = CamState.IDLE
+        Log.i(TAG, "camState: $camState. Starting encoderOutputLoop()")
         encoderLoopRunning.set(true)
         encoderExecutor.execute { encoderOutputLoop() }
     }
 
     private fun encoderOutputLoop() {
+
         val enc = encoder ?: return
         val bufferInfo = MediaCodec.BufferInfo()
         try {
             while (encoderLoopRunning.get()) {
-                val outIndex = enc.dequeueOutputBuffer(bufferInfo, 10_000)
+                val timeout = if (camState == CamState.FINISHING) 500_000L else 10_000L
+                val outIndex = enc.dequeueOutputBuffer(bufferInfo, timeout)
                 when {
                     outIndex >= 0 -> {
                         val encoded = enc.getOutputBuffer(outIndex)
@@ -192,32 +209,40 @@ class MainActivity : AppCompatActivity() {
                                 buf.position(bufferInfo.offset)
                                 buf.limit(bufferInfo.offset + bufferInfo.size)
 
-                                // If a segment is active, write to the current muxer.
-                                if (writingSegment.get() && muxerStarted) {
-                                    // For each segment we subtract the first PTS so segment starts at 0.
-                                    val adjustedPts = bufferInfo.presentationTimeUs - segmentStartPtsUs
+                                if (camState == CamState.RECORDING || camState == CamState.FINISHING) {
+                                    if (segmentStartPtsUs == Long.MAX_VALUE) {
+                                        segmentStartPtsUs = bufferInfo.presentationTimeUs
+                                        Log.d(TAG, "Segment first PTS: $segmentStartPtsUs")
+                                    }
+                                    segmentLengthUs = bufferInfo.presentationTimeUs - segmentStartPtsUs
+                                    allRecordedTimeUs += segmentLengthUs - lastSegmentLengthUs
+                                    lastSegmentLengthUs = segmentLengthUs
                                     val newInfo = MediaCodec.BufferInfo().apply {
-                                        offset = 0
+                                        offset = bufferInfo.offset
                                         size = bufferInfo.size
                                         flags = bufferInfo.flags
-                                        presentationTimeUs = adjustedPts
+                                        presentationTimeUs = segmentLengthUs
                                     }
                                     muxer?.writeSampleData(muxerTrackIndex, buf, newInfo)
+                                    Log.d(TAG, "Writing to muxer: size=${newInfo.size}, pts=${newInfo.presentationTimeUs}")
+
+                                    if (camState == CamState.FINISHING || allRecordedTimeUs >= maxDurationUs) {
+                                        stopMuxerAndFinalizeSegment()
+                                    }
                                 }
                             }
                         }
                         enc.releaseOutputBuffer(outIndex, false)
-
-                        // handle EOS written to muxer: when buffer has EOS flag while writingSegment was true,
-                        // we will stop muxer on stopSegment() instead of here.
                     }
                     outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                        val newFormat = enc.outputFormat
-                        encoderOutputFormat = newFormat // cache so we can create muxer when segment starts
-                        Log.i(TAG, "Encoder output format changed: $newFormat")
+                        encoderOutputFormat = enc.outputFormat
+                        Log.i(TAG, "Encoder output format changed: $encoderOutputFormat")
                     }
                     outIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> {
-                        // no output yet
+                        if (camState == CamState.FINISHING) {
+                            Log.w(TAG, "Timeout waiting for last frame. Finalizing segment anyway.")
+                            stopMuxerAndFinalizeSegment()
+                        }
                     }
                 }
             }
@@ -226,11 +251,61 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun stopMuxerAndFinalizeSegment() {
+        try {
+            muxer?.stop()
+            muxer?.release()
+            Log.i(TAG, "Muxer stopped and released.")
+        } catch (e: Exception) {
+            Log.e(TAG, "Error finalizing muxer", e)
+        } finally {
+            muxer = null
+            muxerTrackIndex = -1
+
+            Log.i(TAG, "Final length: ${segmentLengthUs / 1000} ms. Total recorded: ${allRecordedTimeUs / 1000} ms")
+
+            if (allRecordedTimeUs >= maxDurationUs) {
+                camState = CamState.STITCH
+                Log.i(TAG, "!!! Recording finished. Segments: $segmentFiles")
+                val filesToStitch = ArrayList(segmentFiles)
+                stitchingExecutor.execute {
+                    val stitchedFile = stitchVideos(filesToStitch)
+                    stitchedFile?.let {
+                        runOnUiThread {
+                            val toast = Toast.makeText(this, "Stitched: ${it.name}", Toast.LENGTH_LONG)
+                            toast.show()
+
+                            val fileUri = FileProvider.getUriForFile(
+                                this,
+                                applicationContext.packageName + ".provider",
+                                it
+                            )
+                            val intent = Intent(Intent.ACTION_VIEW).apply {
+                                setDataAndType(fileUri, "video/mp4")
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                            startActivity(intent)
+                        }
+                    }
+                    segmentFiles.clear()
+                    allRecordedTimeUs = 0L
+                    camState = CamState.IDLE
+                }
+            } else {
+                camState = CamState.IDLE
+            }
+
+            segmentStartPtsUs = 0L
+            segmentLengthUs = 0L
+            lastSegmentLengthUs = 0L
+        }
+    }
+
     // -----------------------
     // Camera2 handling
     // -----------------------
     private fun openCamera() {
-        val manager = getSystemService(android.content.Context.CAMERA_SERVICE) as android.hardware.camera2.CameraManager
+        val manager = getSystemService(CAMERA_SERVICE) as CameraManager
         try {
             if (ActivityCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) return
             manager.openCamera(currentCameraId, object : android.hardware.camera2.CameraDevice.StateCallback() {
@@ -266,7 +341,6 @@ class MainActivity : AppCompatActivity() {
         st.setDefaultBufferSize(WIDTH, HEIGHT)
         val previewSurface = Surface(st)
 
-        // encoderSurface must already exist (prepareEncoder called earlier)
         val encSurface = encoderSurface ?: return
 
         try {
@@ -277,7 +351,7 @@ class MainActivity : AppCompatActivity() {
                         try {
                             val request = device.createCaptureRequest(android.hardware.camera2.CameraDevice.TEMPLATE_PREVIEW)
                             request.addTarget(previewSurface)
-                            request.addTarget(encSurface) // feed encoder continuously
+                            request.addTarget(encSurface)
                             request.set(android.hardware.camera2.CaptureRequest.CONTROL_MODE, android.hardware.camera2.CameraMetadata.CONTROL_MODE_AUTO)
                             session.setRepeatingRequest(request.build(), null, null)
                         } catch (e: Exception) {
@@ -297,83 +371,120 @@ class MainActivity : AppCompatActivity() {
     // Segment control
     // -----------------------
     private fun startSegment() {
-        // Wait for encoder format to be available
-        val format = encoderOutputFormat
-        if (format == null) {
-            Toast.makeText(this, "Encoder not ready yet", Toast.LENGTH_SHORT).show()
+        if (camState != CamState.IDLE) return
+        val format = encoderOutputFormat ?: run {
+            Toast.makeText(this, "Encoder not ready", Toast.LENGTH_SHORT).show()
             return
         }
 
-        // create file
-        val outDir = externalMediaDirs.first()
-        val outFile = File(outDir, "segment_${System.currentTimeMillis()}.mp4")
-
-        // setup muxer for this segment
+        val outFile = File(externalMediaDirs.first(), "segment_${System.currentTimeMillis()}.mp4")
         try {
             muxer = MediaMuxer(outFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
             muxerTrackIndex = muxer!!.addTrack(format)
             muxer!!.start()
-            muxerStarted = true
-
             segmentFiles.add(outFile.absolutePath)
-
-            // mark segment start PTS using last-seen buffer PTS idea:
-            // We use current system of cached encoder output timestamps. We'll capture the next
-            // encoder buffer's presentationTimeUs as segmentStartPtsUs.
-            // To simplify: set it to 0 initially, and the encoder loop will subtract the first written buffer timestamp.
-            segmentStartPtsUs = Long.MAX_VALUE // sentinel; will be set at first write
-            writingSegment.set(true)
-
-            // Now set a short listener to capture the first buffer timestamp as soon as it appears.
-            // The encoderOutputLoop will use segmentStartPtsUs when writing; we need to set it when we see the first buffer.
-            // To capture it, we will spin until encoderOutputFormat exists and then wait for first write call to set segmentStartPtsUs.
-            // As a practical approach here: set segmentStartPtsUs to the encoder internal timestamp at next available buffer.
-            // The encoder loop sets adjustedPts = bufferInfo.presentationTimeUs - segmentStartPtsUs
-            // So we must set segmentStartPtsUs at the moment of the first buffer we intend to write.
-            // We implement this by watching for the first write in encoderOutputLoop; to do that, we use the sentinel value
-            // (Long.MAX_VALUE) and in encoderOutputLoop, when writingSegment && segmentStartPtsUs == Long.MAX_VALUE, we set it.
+            segmentStartPtsUs = Long.MAX_VALUE
+            camState = CamState.RECORDING
             Log.i(TAG, "Segment started, writing to ${outFile.absolutePath}")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start muxer", e)
-            writingSegment.set(false)
-            muxerStarted = false
+            camState = CamState.IDLE
             muxer?.release(); muxer = null
         }
     }
 
     private fun stopSegment() {
-        if (!camState ==  writingSegment.get()) return
+        if (camState != CamState.RECORDING) return
+        camState = CamState.FINISHING
+    }
 
-        // stop writing and finalize muxer
-        writingSegment.set(false)
 
-        camState = CamState.WAITING_FOR_NEXT_RECORDING
-        // small delay to ensure the encoder loop wrote last buffers (you can tune/remove)
-        encoderExecutor.execute {
-            try {
-                // wait briefly for encoder to flush current buffers
-                Thread.sleep(100)
-            } catch (e: InterruptedException) { /* ignore */ }
+    @SuppressLint("WrongConstant")
+    private fun stitchVideos(files: List<String>): File? {
+        if (files.isEmpty()) {
+            Log.w(TAG, "stitchVideos: No files to stitch")
+            return null
+        }
 
-            try {
-                if (muxerStarted) {
-                    try {
-                        muxer?.stop()
-                    } catch (e: Exception) {
-                        Log.e(TAG, "muxer.stop() error", e)
+        val outputFile = File(externalMediaDirs.first(), "stitched_${System.currentTimeMillis()}.mp4")
+        var muxer: MediaMuxer? = null
+        var totalDurationUs: Long = 0
+
+        try {
+            muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            muxer.setOrientationHint(90)
+            var videoTrackIndex = -1
+            var firstFileFormat: MediaFormat? = null
+
+            for (filePath in files) {
+                val extractor = MediaExtractor()
+                extractor.setDataSource(filePath)
+
+                var trackIndex = -1
+                for (i in 0 until extractor.trackCount) {
+                    val format = extractor.getTrackFormat(i)
+                    val mime = format.getString(MediaFormat.KEY_MIME)
+                    if (mime?.startsWith("video/") == true) {
+                        trackIndex = i
+                        if (firstFileFormat == null) {
+                            firstFileFormat = format
+                            videoTrackIndex = muxer.addTrack(firstFileFormat)
+                            muxer.start()
+                        }
+                        break
                     }
-                })
-                muxer?.release()
+                }
+
+                if (trackIndex == -1) {
+                    Log.w(TAG, "No video track found in $filePath")
+                    extractor.release()
+                    continue
+                }
+
+                extractor.selectTrack(trackIndex)
+
+                val buffer = java.nio.ByteBuffer.allocate(1024 * 1024)
+                val bufferInfo = MediaCodec.BufferInfo()
+
+                while (true) {
+                    val sampleSize = extractor.readSampleData(buffer, 0)
+                    if (sampleSize < 0) {
+                        break
+                    }
+
+                    bufferInfo.size = sampleSize
+                    bufferInfo.offset = 0
+                    bufferInfo.presentationTimeUs = extractor.sampleTime + totalDurationUs
+                    bufferInfo.flags = extractor.sampleFlags
+
+                    muxer.writeSampleData(videoTrackIndex, buffer, bufferInfo)
+
+                    extractor.advance()
+                }
+
+                totalDurationUs += extractor.getTrackFormat(trackIndex).getLong(MediaFormat.KEY_DURATION)
+                extractor.release()
+            }
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error during stitching", e)
+            return null
+        } finally {
+            muxer?.stop()
+            muxer?.release()
+        }
+
+        // --- Cleanup ---
+        files.forEach {
+            try {
+                File(it).delete()
             } catch (e: Exception) {
-                Log.e(TAG, "Error finalizing muxer", e)
-            } finally {
-                muxer = null
-                muxerStarted = false
-                muxerTrackIndex = -1
-                segmentStartPtsUs = 0L
-                Log.i(TAG, "Segment finalized")
+                Log.e(TAG, "$e, could not delete $it")
             }
         }
+
+        Log.i(TAG, "Stitching complete. Output: ${outputFile.absolutePath}")
+        return outputFile
     }
 
     // -----------------------
@@ -383,12 +494,11 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         encoderLoopRunning.set(false)
         encoderExecutor.shutdownNow()
-
+        stitchingExecutor.shutdownNow()
         try {
             captureSession?.close()
             cameraDevice?.close()
-        } catch (e: Exception) { /* ignore */ }
-
+        } catch (_: Exception) { /* ignore */ }
         encoder?.stop()
         encoder?.release()
         encoder = null
