@@ -162,14 +162,14 @@ class MainActivity : AppCompatActivity() {
                     setDataAndType(fileUri, "video/mp4")
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 }
-                // Verify that there is an app that can handle this intent
-                Log.i(TAG, "intent: $intent")
-                if (intent.resolveActivity(packageManager) != null) {
-                    startActivity(intent)
-                } else {
-                    Toast.makeText(this, "No gallery app found to view videos", Toast.LENGTH_SHORT)
-                        .show()
-                }
+            }
+            // Verify that there is an app that can handle this intent
+            Log.i(TAG, "intent: $intent")
+            if (intent.resolveActivity(packageManager) != null) {
+                startActivity(intent)
+            } else {
+                Toast.makeText(this, "No gallery app found to view videos", Toast.LENGTH_SHORT)
+                    .show()
             }
         }
 
