@@ -17,6 +17,7 @@ import android.view.Surface
 import android.view.TextureView
 import android.view.View
 import android.widget.Button
+import android.widget.ImageButton
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -27,6 +28,9 @@ import com.example.cameraxapp.ui.ProgressRingView
 import java.io.File
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import android.provider.MediaStore // Make sure this import is added at the top
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
 
 class MainActivity : AppCompatActivity() {
     private val TAG = "OpenVine"
@@ -42,11 +46,14 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var textureView: TextureView
     private lateinit var recordButton: View
-    private lateinit var switchButton: Button
+    private lateinit var switchButton: ImageButton
     private lateinit var progressRing: ProgressRingView
+    private lateinit var galleryButton: ImageButton
+    private var lastStitchedFile: File? = null
     // Camera2
     private var cameraDevice: android.hardware.camera2.CameraDevice? = null
     private var captureSession: android.hardware.camera2.CameraCaptureSession? = null
+    private var currentCameraOrientation: Int = 0
     private var currentCameraId: String = ""
     private var rearCameraId: String = ""
     private var frontCameraId: String = ""
@@ -75,7 +82,7 @@ class MainActivity : AppCompatActivity() {
     private val WIDTH = 1280
     private val HEIGHT = 720
     private val FPS = 60
-    private val BITRATE = 32_000_000
+    private val BITRATE = 16_000_000
 
     // Permissions
     private val permissionsLauncher = registerForActivityResult(
@@ -94,6 +101,7 @@ class MainActivity : AppCompatActivity() {
         recordButton = findViewById(R.id.video_capture_button)
         switchButton = findViewById(R.id.switch_camera_button)
         progressRing = findViewById(R.id.progressRing)
+        galleryButton = findViewById(R.id.gallery_button)
 
         val cameraManager = getSystemService(CAMERA_SERVICE) as CameraManager
 
@@ -127,6 +135,33 @@ class MainActivity : AppCompatActivity() {
                     true
                 }
                 else -> false
+            }
+        }
+
+        galleryButton.setOnClickListener {
+            val intent: Intent
+            if (lastStitchedFile == null) {
+                Log.i(TAG, "Show all media files")
+                intent = Intent(Intent.ACTION_VIEW, MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
+            } else {
+                val fileUri = FileProvider.getUriForFile(
+                    this,
+                    applicationContext.packageName + ".provider",
+                    lastStitchedFile!!
+                )
+                Log.i(TAG, "Show $fileUri")
+                // Show last recorded video directly
+                intent = Intent(Intent.ACTION_VIEW).apply {
+                    setDataAndType(fileUri, "video/mp4")
+                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                }
+            }
+            // Verify that there is an app that can handle this intent
+            Log.i(TAG, "intent: $intent")
+            if (intent.resolveActivity(packageManager) != null) {
+                startActivity(intent)
+            } else {
+                Toast.makeText(this, "No gallery app found to view videos", Toast.LENGTH_SHORT).show()
             }
         }
 
@@ -194,7 +229,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun encoderOutputLoop() {
-
         val enc = encoder ?: return
         val bufferInfo = MediaCodec.BufferInfo()
         try {
@@ -271,20 +305,9 @@ class MainActivity : AppCompatActivity() {
                 stitchingExecutor.execute {
                     val stitchedFile = stitchVideos(filesToStitch)
                     stitchedFile?.let {
+                        lastStitchedFile = it
                         runOnUiThread {
-                            val toast = Toast.makeText(this, "Stitched: ${it.name}", Toast.LENGTH_LONG)
-                            toast.show()
-
-                            val fileUri = FileProvider.getUriForFile(
-                                this,
-                                applicationContext.packageName + ".provider",
-                                it
-                            )
-                            val intent = Intent(Intent.ACTION_VIEW).apply {
-                                setDataAndType(fileUri, "video/mp4")
-                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                            }
-                            startActivity(intent)
+                            Toast.makeText(this, "${it.name}", Toast.LENGTH_SHORT).show()
                         }
                     }
                     segmentFiles.clear()
@@ -306,12 +329,19 @@ class MainActivity : AppCompatActivity() {
     // -----------------------
     private fun openCamera() {
         val manager = getSystemService(CAMERA_SERVICE) as CameraManager
+
+        // Get orientaion
+        val characteristics = manager.getCameraCharacteristics(currentCameraId)
+        currentCameraOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+        currentCameraOrientation -= 90
+
         try {
             if (ActivityCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) return
             manager.openCamera(currentCameraId, object : android.hardware.camera2.CameraDevice.StateCallback() {
                 override fun onOpened(device: android.hardware.camera2.CameraDevice) {
                     cameraDevice = device
                     createCaptureSession()
+                    Log.i(TAG,"Opened the cam $currentCameraId. Orientation: $currentCameraOrientation")
                 }
                 override fun onDisconnected(device: android.hardware.camera2.CameraDevice) {
                     device.close()
@@ -381,6 +411,7 @@ class MainActivity : AppCompatActivity() {
         try {
             muxer = MediaMuxer(outFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
             muxerTrackIndex = muxer!!.addTrack(format)
+            muxer!!.setOrientationHint(currentCameraOrientation)
             muxer!!.start()
             segmentFiles.add(outFile.absolutePath)
             segmentStartPtsUs = Long.MAX_VALUE
@@ -406,7 +437,9 @@ class MainActivity : AppCompatActivity() {
             return null
         }
 
-        val outputFile = File(externalMediaDirs.first(), "stitched_${System.currentTimeMillis()}.mp4")
+        // Output file name is the timestamp
+        val fName = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy_MM_dd_HH_mm_ss"))
+        val outputFile = File(externalMediaDirs.first(), "$fName.mp4")
         var muxer: MediaMuxer? = null
         var totalDurationUs: Long = 0
 
@@ -482,6 +515,15 @@ class MainActivity : AppCompatActivity() {
                 Log.e(TAG, "$e, could not delete $it")
             }
         }
+
+        // Notify the MediaStore that a new video has been created.
+        // This makes it appear in the gallery immediately.
+        MediaScannerConnection.scanFile(
+            applicationContext,
+            arrayOf(outputFile.absolutePath),
+            arrayOf("video/mp4"),
+            null
+        )
 
         Log.i(TAG, "Stitching complete. Output: ${outputFile.absolutePath}")
         return outputFile
