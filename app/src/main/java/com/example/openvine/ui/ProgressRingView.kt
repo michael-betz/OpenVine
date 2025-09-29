@@ -1,4 +1,4 @@
-package com.example.cameraxapp.ui
+package com.example.openvine.ui
 
 import android.content.Context
 import android.graphics.Canvas

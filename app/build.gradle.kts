@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace = "com.example.cameraxapp"
+    namespace = "com.example.openvine"
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.example.cameraxapp"
+        applicationId = "com.example.openvine"
         minSdk = 26
         targetSdk = 36
         versionCode = 1

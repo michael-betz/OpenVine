@@ -24,7 +24,7 @@
         app:layout_constraintEnd_toEndOf="parent">
 
         <!-- Outer progress ring -->
-        <com.example.cameraxapp.ui.ProgressRingView
+        <com.example.openvine.ui.ProgressRingView
             android:id="@+id/progressRing"
             android:layout_width="match_parent"
             android:layout_height="match_parent" />
