@@ -7,11 +7,19 @@ import android.content.pm.PackageManager
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
-import android.media.*
+import android.hardware.display.DisplayManager
+import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaExtractor
+import android.media.MediaFormat
+import android.media.MediaMuxer
+import android.media.MediaScannerConnection
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.MediaStore
 import android.util.Log
+import android.view.Display
 import android.view.MotionEvent
 import android.view.Surface
 import android.view.TextureView
@@ -25,11 +33,10 @@ import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import com.example.openvine.ui.ProgressRingView
 import java.io.File
-import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicBoolean
-import android.provider.MediaStore // Make sure this import is added at the top
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : AppCompatActivity() {
     private val TAG = "OpenVine"
@@ -39,10 +46,19 @@ class MainActivity : AppCompatActivity() {
         IDLE,
         RECORDING,
         FINISHING, // User has requested stop, but we must wait for the last frame to be encoded
-
     }
 
     private var camState: CamState = CamState.IDLE
+
+    /** Detects, characterizes, and connects to a CameraDevice (used for all camera operations) */
+    private val cameraManager: CameraManager by lazy {
+        applicationContext.getSystemService(CAMERA_SERVICE) as CameraManager
+    }
+
+    /** [DisplayManager] to listen to display changes */
+    private val displayManager: DisplayManager by lazy {
+        applicationContext.getSystemService(DISPLAY_SERVICE) as DisplayManager
+    }
 
     private lateinit var textureView: TextureView
     private lateinit var recordButton: View
@@ -89,6 +105,24 @@ class MainActivity : AppCompatActivity() {
     private val FPS = 60
     private val BITRATE = 16_000_000
 
+
+    /**
+     * Every time the size of the TextureSize changes,
+     * we calculate the scale and create a new session
+     */
+    private val surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+        override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
+            createCaptureSession()
+        }
+
+        override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
+            createCaptureSession()
+        }
+
+        override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {}
+        override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean = false
+    }
+
     // Permissions
     private val permissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -107,8 +141,6 @@ class MainActivity : AppCompatActivity() {
         switchButton = findViewById(R.id.switch_camera_button)
         progressRing = findViewById(R.id.progressRing)
         galleryButton = findViewById(R.id.gallery_button)
-
-        val cameraManager = getSystemService(CAMERA_SERVICE) as CameraManager
 
         for (id in cameraManager.cameraIdList) {
             val characteristics = cameraManager.getCameraCharacteristics(id)
@@ -411,6 +443,7 @@ class MainActivity : AppCompatActivity() {
                     override fun onOpened(device: android.hardware.camera2.CameraDevice) {
                         cameraDevice = device
                         createCaptureSession()
+                        textureView.surfaceTextureListener = surfaceTextureListener
                         Log.i(
                             TAG,
                             "Opened the cam $currentCameraId. Orientation: $currentCameraOrientation"
@@ -449,8 +482,12 @@ class MainActivity : AppCompatActivity() {
         val device = cameraDevice ?: return
         val st = textureView.surfaceTexture ?: return
         st.setDefaultBufferSize(WIDTH, HEIGHT)
-        val previewSurface = Surface(st)
 
+        val transformedTexture = CameraUtils.buildTargetTexture(
+            textureView, cameraManager.getCameraCharacteristics(currentCameraId),
+            displayManager.getDisplay(Display.DEFAULT_DISPLAY).rotation
+        )
+        val previewSurface = Surface(transformedTexture)
         val encSurface = encoderSurface ?: return
 
         try {
