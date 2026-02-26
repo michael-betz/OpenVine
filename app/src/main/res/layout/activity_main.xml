@@ -5,7 +5,7 @@
     xmlns:tools="http://schemas.android.com/tools"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    tools:context=".MainActivity">
+    tools:context="ch.betz_engineering.openvine.MainActivity">
 
     <!-- Camera preview -->
     <TextureView
@@ -24,7 +24,7 @@
         app:layout_constraintEnd_toEndOf="parent">
 
         <!-- Outer progress ring -->
-        <com.example.openvine.ui.ProgressRingView
+        <ch.betz_engineering.openvine.ui.ProgressRingView
             android:id="@+id/progressRing"
             android:layout_width="match_parent"
             android:layout_height="match_parent" />

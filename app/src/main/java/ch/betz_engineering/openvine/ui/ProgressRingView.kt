@@ -1,4 +1,4 @@
-package com.example.openvine.ui
+package ch.betz_engineering.openvine.ui
 
 import android.content.Context
 import android.graphics.Canvas

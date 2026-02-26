@@ -1,12 +1,16 @@
-package com.example.openvine
+package ch.betz_engineering.openvine
 
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.SurfaceTexture
+import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CameraMetadata
+import android.hardware.camera2.CaptureRequest
 import android.hardware.display.DisplayManager
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
@@ -31,8 +35,9 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
-import com.example.openvine.ui.ProgressRingView
+import ch.betz_engineering.openvine.ui.ProgressRingView
 import java.io.File
+import java.nio.ByteBuffer
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 import java.util.concurrent.Executors
@@ -55,7 +60,7 @@ class MainActivity : AppCompatActivity() {
         applicationContext.getSystemService(CAMERA_SERVICE) as CameraManager
     }
 
-    /** [DisplayManager] to listen to display changes */
+    /** [android.hardware.display.DisplayManager] to listen to display changes */
     private val displayManager: DisplayManager by lazy {
         applicationContext.getSystemService(DISPLAY_SERVICE) as DisplayManager
     }
@@ -68,8 +73,8 @@ class MainActivity : AppCompatActivity() {
     private var lastStitchedFile: File? = null
 
     // Camera2
-    private var cameraDevice: android.hardware.camera2.CameraDevice? = null
-    private var captureSession: android.hardware.camera2.CameraCaptureSession? = null
+    private var cameraDevice: CameraDevice? = null
+    private var captureSession: CameraCaptureSession? = null
     private var currentCameraOrientation: Int = 0
     private var currentCameraId: String = ""
     private var rearCameraId: String = ""
@@ -439,8 +444,8 @@ class MainActivity : AppCompatActivity() {
             ) return
             manager.openCamera(
                 currentCameraId,
-                object : android.hardware.camera2.CameraDevice.StateCallback() {
-                    override fun onOpened(device: android.hardware.camera2.CameraDevice) {
+                object : CameraDevice.StateCallback() {
+                    override fun onOpened(device: CameraDevice) {
                         cameraDevice = device
                         createCaptureSession()
                         textureView.surfaceTextureListener = surfaceTextureListener
@@ -450,13 +455,13 @@ class MainActivity : AppCompatActivity() {
                         )
                     }
 
-                    override fun onDisconnected(device: android.hardware.camera2.CameraDevice) {
+                    override fun onDisconnected(device: CameraDevice) {
                         device.close()
                         cameraDevice = null
                     }
 
                     override fun onError(
-                        device: android.hardware.camera2.CameraDevice,
+                        device: CameraDevice,
                         error: Int
                     ) {
                         device.close()
@@ -493,17 +498,17 @@ class MainActivity : AppCompatActivity() {
         try {
             device.createCaptureSession(
                 listOf(previewSurface, encSurface),
-                object : android.hardware.camera2.CameraCaptureSession.StateCallback() {
-                    override fun onConfigured(session: android.hardware.camera2.CameraCaptureSession) {
+                object : CameraCaptureSession.StateCallback() {
+                    override fun onConfigured(session: CameraCaptureSession) {
                         captureSession = session
                         try {
                             val request =
-                                device.createCaptureRequest(android.hardware.camera2.CameraDevice.TEMPLATE_PREVIEW)
+                                device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
                             request.addTarget(previewSurface)
                             request.addTarget(encSurface)
                             request.set(
-                                android.hardware.camera2.CaptureRequest.CONTROL_MODE,
-                                android.hardware.camera2.CameraMetadata.CONTROL_MODE_AUTO
+                                CaptureRequest.CONTROL_MODE,
+                                CameraMetadata.CONTROL_MODE_AUTO
                             )
                             session.setRepeatingRequest(request.build(), null, null)
                         } catch (e: Exception) {
@@ -511,7 +516,7 @@ class MainActivity : AppCompatActivity() {
                         }
                     }
 
-                    override fun onConfigureFailed(session: android.hardware.camera2.CameraCaptureSession) {
+                    override fun onConfigureFailed(session: CameraCaptureSession) {
                         Log.e(TAG, "capture session config failed")
                     }
                 }, null
@@ -604,7 +609,7 @@ class MainActivity : AppCompatActivity() {
 
                 extractor.selectTrack(trackIndex)
 
-                val buffer = java.nio.ByteBuffer.allocate(1024 * 1024)
+                val buffer = ByteBuffer.allocate(1024 * 1024)
                 val bufferInfo = MediaCodec.BufferInfo()
 
                 while (true) {

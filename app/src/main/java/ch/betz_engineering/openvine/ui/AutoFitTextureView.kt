@@ -1,9 +1,8 @@
-package com.example.openvine.ui
+package ch.betz_engineering.openvine.ui
 
 import android.content.Context
 import android.util.AttributeSet
 import android.view.TextureView
-import kotlin.math.roundToInt
 
 /**
  * A [TextureView] that can be adjusted to a specified aspect ratio.
