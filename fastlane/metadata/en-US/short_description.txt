@@ -1,0 +1,1 @@
+A camera for short-form video clips, inspired by the old-school Vine app
