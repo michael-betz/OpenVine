@@ -34,6 +34,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            setProperty("archivesBaseName", "OpenVine-v${defaultConfig.versionName}")
         }
     }
     compileOptions {
