@@ -1,4 +1,4 @@
-package ch.betz_engineering.openvine
+package ch.betzengineering.openvine
 
 import android.Manifest
 import android.annotation.SuppressLint
@@ -35,7 +35,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
-import ch.betz_engineering.openvine.ui.ProgressRingView
+import ch.betzengineering.openvine.ui.ProgressRingView
 import java.io.File
 import java.nio.ByteBuffer
 import java.time.LocalDateTime

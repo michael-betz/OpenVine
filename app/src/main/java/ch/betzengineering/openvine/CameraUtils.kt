@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-package ch.betz_engineering.openvine
+package ch.betzengineering.openvine
 
 import android.graphics.Matrix
 import android.graphics.SurfaceTexture

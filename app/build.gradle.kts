@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace = "ch.betz_engineering.openvine"
+    namespace = "ch.betzengineering.openvine"
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "ch.betz_engineering.openvine"
+        applicationId = "ch.betzengineering.openvine"
         minSdk = 26
         targetSdk = 36
         versionCode = 1
