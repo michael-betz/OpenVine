@@ -1,0 +1,12 @@
+OpenVine is a camera app inspired by the mechanics of the classic Vine application. It allows you to create short, looping videos with ease.
+
+**Features:**
+
+*   The app records only while you keep the big red button pressed.
+*   You can release the button to change angles or scenes. Once you have recorded a total of 6 seconds, the app automatically stitches all the clips together into a single video file.
+*   This is purely a camera utility. There is no external server, no account login, and no cloud tracking.
+*   Videos are stored locally on your device. You can easily forward them to instant messengers, email, or social networks using the built-in Android share functionality.
+
+**Artistic effects:**
+
+The selfie camera may record upside-down on certain devices. This is definitely not a bug but an artistic choice. If you don't want to record upside down, rotate your phone by 180 degrees before recording selfies.
