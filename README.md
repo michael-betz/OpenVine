@@ -9,4 +9,11 @@ This is really just a camera app, there is no external server component. Videos 
   * The selfie camera records upside-down. The workaround is to turn your phone by 180 degrees before recording with the selfie camera 🤣
 
 # Download
-The app is available on F-Droid (once approved) and under [Releases](https://github.com/michael-betz/OpenVine/releases) as a signed .apk file.
+
+<a href="https://f-droid.org/packages/ch.betzengineering.openvine">
+    <img src="https://f-droid.org/badge/get-it-on.png"
+    alt="Get it on F-Droid"
+    height="80">
+</a>
+
+and under [Releases](https://github.com/michael-betz/OpenVine/releases) as a signed .apk file.
