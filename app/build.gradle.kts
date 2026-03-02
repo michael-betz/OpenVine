@@ -19,7 +19,7 @@ android {
 
     signingConfigs {
         create("release") {
-                storeFile = File("/home/michael/be-android-release-key.jks")
+                storeFile = File(System.getenv("KEYSTORE_FILE"))
                 storePassword = System.getenv("KEYSTORE_PASSWORD")
                 keyAlias = "be-android-release-key"
                 keyPassword = System.getenv("KEYSTORE_PASSWORD")
