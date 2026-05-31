@@ -77,8 +77,8 @@ class MainActivity : AppCompatActivity() {
     private var captureSession: CameraCaptureSession? = null
     private var currentCameraOrientation: Int = 0
     private var currentCameraId: String = ""
-    private var rearCameraId: String = ""
-    private var frontCameraId: String = ""
+    private var allCameraIds: MutableList<String> = mutableListOf()
+    private var currentCameraIndex: Int = 0
 
     // Encoder / muxer
     @Volatile
@@ -147,21 +147,31 @@ class MainActivity : AppCompatActivity() {
         progressRing = findViewById(R.id.progressRing)
         galleryButton = findViewById(R.id.gallery_button)
 
+        // Collect all cameras: rear cameras first, then front camera
         for (id in cameraManager.cameraIdList) {
             val characteristics = cameraManager.getCameraCharacteristics(id)
             val facing = characteristics.get(CameraCharacteristics.LENS_FACING)
-            when (facing) {
-                CameraCharacteristics.LENS_FACING_BACK -> rearCameraId = id
-                CameraCharacteristics.LENS_FACING_FRONT -> frontCameraId = id
+            if (facing == CameraCharacteristics.LENS_FACING_BACK) {
+                allCameraIds.add(id)
+            }
+        }
+        for (id in cameraManager.cameraIdList) {
+            val characteristics = cameraManager.getCameraCharacteristics(id)
+            val facing = characteristics.get(CameraCharacteristics.LENS_FACING)
+            if (facing == CameraCharacteristics.LENS_FACING_FRONT) {
+                allCameraIds.add(id)
             }
         }
 
-        // Rear default
-        currentCameraId = rearCameraId
+        // Default to first camera (first rear camera)
+        currentCameraIndex = 0
+        currentCameraId = allCameraIds.firstOrNull() ?: ""
 
-        // --- SWITCH BUTTON ---
+        // --- SWITCH CAMERA BUTTON ---
+        // Cycles through all rear cameras, then front camera, then back to first rear
         switchButton.setOnClickListener {
-            currentCameraId = if (currentCameraId == rearCameraId) frontCameraId else rearCameraId
+            currentCameraIndex = (currentCameraIndex + 1) % allCameraIds.size
+            currentCameraId = allCameraIds[currentCameraIndex]
             closeCamera()
             openCamera()
         }
