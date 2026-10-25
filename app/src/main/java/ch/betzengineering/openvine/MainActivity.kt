@@ -21,8 +21,10 @@ import android.media.MediaScannerConnection
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.util.Log
+import android.util.Range
 import android.view.Display
 import android.view.MotionEvent
 import android.view.Surface
@@ -41,9 +43,26 @@ import java.nio.ByteBuffer
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.abs
 
 class MainActivity : AppCompatActivity() {
+    companion object {
+        // Desired video params
+        private const val WIDTH = 1280
+        private const val HEIGHT = 720
+        private const val FPS = 60
+        private const val BITRATE = 16_000_000
+        private const val AUDIO_BITRATE = 128_000
+
+        // Samples of silence the AAC encoder puts in front of the audio.
+        // Video is delayed by the same amount to keep audio and video in sync.
+        private const val AAC_ENCODER_DELAY_SAMPLES = 2048
+
+        private const val PREF_MIC_ASKED = "mic_permission_asked"
+    }
+
     private val TAG = "OpenVine"
 
     private enum class CamState {
@@ -53,6 +72,7 @@ class MainActivity : AppCompatActivity() {
         FINISHING, // User has requested stop, but we must wait for the last frame to be encoded
     }
 
+    @Volatile
     private var camState: CamState = CamState.IDLE
 
     /** Detects, characterizes, and connects to a CameraDevice (used for all camera operations) */
@@ -70,6 +90,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var switchButton: ImageButton
     private lateinit var progressRing: ProgressRingView
     private lateinit var galleryButton: ImageButton
+    @Volatile
     private var lastStitchedFile: File? = null
 
     // Camera2
@@ -94,21 +115,38 @@ class MainActivity : AppCompatActivity() {
     @Volatile
     private var muxer: MediaMuxer? = null
     private var muxerTrackIndex = -1
+    @Volatile
     private var segmentStartPtsUs: Long = 0L
+
+    // Frames written to the current segment, used to measure the actual frame duration
+    private var segmentFrameCount = 0
+
+    // Nominal frame duration of the currently selected FPS range
+    @Volatile
+    private var frameDurationUs: Long = 1_000_000L / FPS
+    private var fpsRange: Range<Int>? = null
+
+    // Offset to convert video PTS to the boottime clock used by AudioCapture
+    private var ptsToBoottimeUs: Long = 0L
     private var lastSegmentLengthUs: Long = 0L
+    @Volatile
     private var segmentLengthUs: Long = 0L
-    private val segmentFiles = mutableListOf<String>()
+    @Volatile
+    private var segmentFile: String? = null
+    private val segments = mutableListOf<Segment>()
+    @Volatile
     private var allRecordedTimeUs: Long = 0L
     private var maxDurationUs: Long = 6000000L
+
+    /** A recorded piece of video plus the audio belonging to it */
+    private class Segment(val path: String, val durationUs: Long, val audio: ShortArray?)
+
+    // Audio
+    private val audioCapture = AudioCapture()
 
     // Encoding loop control
     private val encoderLoopRunning = AtomicBoolean(false)
 
-    // Desired video params
-    private val WIDTH = 1280
-    private val HEIGHT = 720
-    private val FPS = 60
-    private val BITRATE = 16_000_000
 
 
     /**
@@ -132,8 +170,13 @@ class MainActivity : AppCompatActivity() {
     private val permissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { perms ->
-        val ok = perms.entries.all { it.value }
-        if (ok) startEverything()
+        val ok = cameraPermissionGranted()
+        if (perms[Manifest.permission.RECORD_AUDIO] == false)
+            Toast.makeText(this, "No microphone permission, recording without sound", Toast.LENGTH_SHORT).show()
+        if (ok) {
+            startAudio()
+            startEverything()
+        }
         else Toast.makeText(this, "Permissions required", Toast.LENGTH_SHORT).show()
     }
 
@@ -229,15 +272,23 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
-        if (!allPermissionsGranted()) {
-            permissionsLauncher.launch(arrayOf(Manifest.permission.CAMERA))
+        // The camera is required, ask every time. The microphone is optional, ask only once
+        // so users who prefer silent videos are not nagged.
+        val prefs = getPreferences(MODE_PRIVATE)
+        val toRequest = mutableListOf<String>()
+        if (!cameraPermissionGranted()) toRequest.add(Manifest.permission.CAMERA)
+        if (!micPermissionGranted() && !prefs.getBoolean(PREF_MIC_ASKED, false)) {
+            toRequest.add(Manifest.permission.RECORD_AUDIO)
+            prefs.edit().putBoolean(PREF_MIC_ASKED, true).apply()
         }
+        if (toRequest.isNotEmpty()) permissionsLauncher.launch(toRequest.toTypedArray())
     }
 
     override fun onResume() {
         super.onResume()
         // If the texture is already available, the listener won't be called again.
         // We need to restart the camera preview manually.
+        startAudio()
         if (textureView.isAvailable) {
             prepareEncoder()
             openCamera()
@@ -252,14 +303,20 @@ class MainActivity : AppCompatActivity() {
         // and to prevent resource leaks.
         closeCamera()
         releaseEncoder()
+        audioCapture.stop()
     }
 
 
-    private fun allPermissionsGranted(): Boolean {
-        return ContextCompat.checkSelfPermission(
-            this,
-            Manifest.permission.CAMERA
-        ) == PackageManager.PERMISSION_GRANTED
+    private fun cameraPermissionGranted(): Boolean =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
+                PackageManager.PERMISSION_GRANTED
+
+    private fun micPermissionGranted(): Boolean =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+                PackageManager.PERMISSION_GRANTED
+
+    private fun startAudio() {
+        if (micPermissionGranted()) audioCapture.start()
     }
 
     private fun startEverything() {
@@ -303,15 +360,27 @@ class MainActivity : AppCompatActivity() {
         encoder = enc
 
         // Start loop that drains encoder output continuously.
-        camState = CamState.IDLE
+        // A stitch still running in the background sets IDLE itself when done.
+        if (camState != CamState.STITCH) camState = CamState.IDLE
         Log.i(TAG, "camState: $camState. Starting encoderOutputLoop()")
         encoderLoopRunning.set(true)
         encoderExecutor.execute { encoderOutputLoop() }
     }
 
     private fun releaseEncoder() {
-        // Stop the encoder loop and release all encoder-related resources.
+        // Stop the encoder loop, then finish a segment that is still being recorded.
+        // Runs on the encoder thread, so it happens after the loop has exited.
         encoderLoopRunning.set(false)
+        try {
+            encoderExecutor.submit {
+                if (muxer != null) {
+                    Log.i(TAG, "Paused while recording, finalizing segment")
+                    stopMuxerAndFinalizeSegment()
+                }
+            }.get(2, TimeUnit.SECONDS)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to finalize segment", e)
+        }
         encoder?.let {
             try {
                 it.stop()
@@ -343,8 +412,11 @@ class MainActivity : AppCompatActivity() {
                                 if (camState == CamState.RECORDING || camState == CamState.FINISHING) {
                                     if (segmentStartPtsUs == Long.MAX_VALUE) {
                                         segmentStartPtsUs = bufferInfo.presentationTimeUs
+                                        allRecordedTimeUs += frameDurationUs
+                                        ptsToBoottimeUs = ptsClockOffsetUs(segmentStartPtsUs)
                                         Log.d(TAG, "Segment first PTS: $segmentStartPtsUs")
                                     }
+                                    segmentFrameCount++
                                     segmentLengthUs =
                                         bufferInfo.presentationTimeUs - segmentStartPtsUs
                                     allRecordedTimeUs += segmentLengthUs - lastSegmentLengthUs
@@ -391,6 +463,19 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Video PTS should use the boottime clock (SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME), but some
+     * devices deliver monotonic timestamps anyway, which differ by the time spent in deep sleep.
+     * Detect the clock by checking which one the (fresh) frame timestamp is closer to.
+     */
+    private fun ptsClockOffsetUs(ptsUs: Long): Long {
+        val bootUs = SystemClock.elapsedRealtimeNanos() / 1000
+        val monoUs = System.nanoTime() / 1000
+        val offset = if (abs(ptsUs - monoUs) < abs(ptsUs - bootUs)) bootUs - monoUs else 0L
+        Log.d(TAG, "PTS clock: ${if (offset == 0L) "boottime" else "monotonic"}, offset=$offset us")
+        return offset
+    }
+
     private fun stopMuxerAndFinalizeSegment() {
         try {
             muxer?.stop()
@@ -402,6 +487,23 @@ class MainActivity : AppCompatActivity() {
             muxer = null
             muxerTrackIndex = -1
 
+            // Cut the matching audio. Duration includes the display time of the last frame.
+            segmentFile?.let { path ->
+                if (segmentStartPtsUs != Long.MAX_VALUE) {
+                    val lastFrameUs =
+                        if (segmentFrameCount > 1) segmentLengthUs / (segmentFrameCount - 1)
+                        else frameDurationUs
+                    val durationUs = segmentLengthUs + lastFrameUs
+                    val audio =
+                        if (audioCapture.isRunning) audioCapture.extract(segmentStartPtsUs + ptsToBoottimeUs, durationUs)
+                        else null
+                    segments.add(Segment(path, durationUs, audio))
+                } else {
+                    File(path).delete() // no frame was written
+                }
+            }
+            segmentFile = null
+
             Log.i(
                 TAG,
                 "Final length: ${segmentLengthUs / 1000} ms. Total recorded: ${allRecordedTimeUs / 1000} ms"
@@ -409,10 +511,11 @@ class MainActivity : AppCompatActivity() {
 
             if (allRecordedTimeUs >= maxDurationUs) {
                 camState = CamState.STITCH
-                Log.i(TAG, "!!! Recording finished. Segments: $segmentFiles")
-                val filesToStitch = ArrayList(segmentFiles)
+                Log.i(TAG, "!!! Recording finished. Segments: ${segments.size}")
+                val toStitch = ArrayList(segments)
+                segments.clear()
                 stitchingExecutor.execute {
-                    val stitchedFile = stitchVideos(filesToStitch)
+                    val stitchedFile = stitchVideos(toStitch)
                     stitchedFile?.let {
                         lastStitchedFile = it
                         runOnUiThread {
@@ -420,7 +523,6 @@ class MainActivity : AppCompatActivity() {
                             Toast.makeText(this, "${it.name}", Toast.LENGTH_SHORT).show()
                         }
                     }
-                    segmentFiles.clear()
                     allRecordedTimeUs = 0L
                     camState = CamState.IDLE
                 }
@@ -445,6 +547,14 @@ class MainActivity : AppCompatActivity() {
         currentCameraOrientation =
             characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
         currentCameraOrientation -= 90
+
+        fpsRange = chooseFpsRange(characteristics)
+        fpsRange?.let { frameDurationUs = 1_000_000L / it.upper }
+        val sizeOk = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            ?.getOutputSizes(MediaCodec::class.java)
+            ?.any { it.width == WIDTH && it.height == HEIGHT } ?: false
+        if (!sizeOk) Log.w(TAG, "Camera $currentCameraId does not support ${WIDTH}x$HEIGHT")
+        Log.i(TAG, "Camera $currentCameraId FPS range: $fpsRange")
 
         try {
             if (ActivityCompat.checkSelfPermission(
@@ -485,6 +595,14 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** Prefers a fixed [FPS] range, then the range reaching closest to [FPS] */
+    private fun chooseFpsRange(characteristics: CameraCharacteristics): Range<Int>? {
+        val ranges = characteristics.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+            ?: return null
+        return ranges.filter { it.upper <= FPS }
+            .maxWithOrNull(compareBy<Range<Int>> { it.upper }.thenBy { it.lower })
+    }
+
     private fun closeCamera() {
         captureSession?.close()
         captureSession = null
@@ -513,13 +631,16 @@ class MainActivity : AppCompatActivity() {
                         captureSession = session
                         try {
                             val request =
-                                device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+                                device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
                             request.addTarget(previewSurface)
                             request.addTarget(encSurface)
                             request.set(
                                 CaptureRequest.CONTROL_MODE,
                                 CameraMetadata.CONTROL_MODE_AUTO
                             )
+                            fpsRange?.let {
+                                request.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it)
+                            }
                             session.setRepeatingRequest(request.build(), null, null)
                         } catch (e: Exception) {
                             Log.e(TAG, "createCaptureSession -> setRepeatingRequest", e)
@@ -554,7 +675,8 @@ class MainActivity : AppCompatActivity() {
             muxerTrackIndex = muxer!!.addTrack(format)
             muxer!!.setOrientationHint(currentCameraOrientation)
             muxer!!.start()
-            segmentFiles.add(outFile.absolutePath)
+            segmentFile = outFile.absolutePath
+            segmentFrameCount = 0
             segmentStartPtsUs = Long.MAX_VALUE
             camState = CamState.RECORDING
             Log.i(TAG, "Segment started, writing to ${outFile.absolutePath}")
@@ -572,9 +694,9 @@ class MainActivity : AppCompatActivity() {
 
 
     @SuppressLint("WrongConstant")
-    private fun stitchVideos(files: List<String>): File? {
-        if (files.isEmpty()) {
-            Log.w(TAG, "stitchVideos: No files to stitch")
+    private fun stitchVideos(segs: List<Segment>): File? {
+        if (segs.isEmpty()) {
+            Log.w(TAG, "stitchVideos: No segments to stitch")
             return null
         }
 
@@ -583,18 +705,25 @@ class MainActivity : AppCompatActivity() {
             LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy_MM_dd_HH_mm_ss"))
         val outputFile = File(externalMediaDirs.first(), "$fName.mp4")
         var muxer: MediaMuxer? = null
-        var totalDurationUs: Long = 0
+        var muxerStarted = false
 
         try {
+            // Encode the audio of all segments in one go: no encoder priming at every cut
+            val aac = if (segs.all { it.audio != null }) encodeAac(concatAudio(segs)) else null
+            val videoOffsetUs =
+                if (aac != null) AAC_ENCODER_DELAY_SAMPLES * 1_000_000L / AudioCapture.SAMPLE_RATE
+                else 0L
+
             muxer =
                 MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
             muxer.setOrientationHint(90)
             var videoTrackIndex = -1
-            var firstFileFormat: MediaFormat? = null
+            var audioTrackIndex = -1
+            var totalDurationUs = videoOffsetUs
 
-            for (filePath in files) {
+            for (seg in segs) {
                 val extractor = MediaExtractor()
-                extractor.setDataSource(filePath)
+                extractor.setDataSource(seg.path)
 
                 var trackIndex = -1
                 for (i in 0 until extractor.trackCount) {
@@ -602,17 +731,18 @@ class MainActivity : AppCompatActivity() {
                     val mime = format.getString(MediaFormat.KEY_MIME)
                     if (mime?.startsWith("video/") == true) {
                         trackIndex = i
-                        if (firstFileFormat == null) {
-                            firstFileFormat = format
-                            videoTrackIndex = muxer.addTrack(firstFileFormat)
+                        if (!muxerStarted) {
+                            videoTrackIndex = muxer.addTrack(format)
+                            if (aac != null) audioTrackIndex = muxer.addTrack(aac.first)
                             muxer.start()
+                            muxerStarted = true
                         }
                         break
                     }
                 }
 
                 if (trackIndex == -1) {
-                    Log.w(TAG, "No video track found in $filePath")
+                    Log.w(TAG, "No video track found in ${seg.path}")
                     extractor.release()
                     continue
                 }
@@ -638,25 +768,33 @@ class MainActivity : AppCompatActivity() {
                     extractor.advance()
                 }
 
-                totalDurationUs += extractor.getTrackFormat(trackIndex)
-                    .getLong(MediaFormat.KEY_DURATION)
+                // Same duration as used for cutting the audio, keeps both tracks in sync
+                totalDurationUs += seg.durationUs
                 extractor.release()
+            }
+
+            if (aac != null && audioTrackIndex >= 0) {
+                val info = MediaCodec.BufferInfo()
+                for ((ptsUs, data) in aac.second) {
+                    info.set(0, data.size, ptsUs, MediaCodec.BUFFER_FLAG_KEY_FRAME)
+                    muxer.writeSampleData(audioTrackIndex, ByteBuffer.wrap(data), info)
+                }
             }
 
         } catch (e: Exception) {
             Log.e(TAG, "Error during stitching", e)
             return null
         } finally {
-            muxer?.stop()
+            if (muxerStarted) muxer?.stop()
             muxer?.release()
         }
 
         // --- Cleanup ---
-        files.forEach {
+        segs.forEach {
             try {
-                File(it).delete()
+                File(it.path).delete()
             } catch (e: Exception) {
-                Log.e(TAG, "$e, could not delete $it")
+                Log.e(TAG, "$e, could not delete ${it.path}")
             }
         }
 
@@ -671,6 +809,89 @@ class MainActivity : AppCompatActivity() {
 
         Log.i(TAG, "Stitching complete. Output: ${outputFile.absolutePath}")
         return outputFile
+    }
+
+    /** Joins the audio of all segments, with a short fade at every cut to avoid clicks */
+    private fun concatAudio(segs: List<Segment>): ShortArray {
+        val fadeLen = AudioCapture.SAMPLE_RATE * 3 / 1000 // 3 ms
+        val out = ShortArray(segs.sumOf { it.audio!!.size })
+        var pos = 0
+        for ((index, seg) in segs.withIndex()) {
+            val a = seg.audio!!
+            val n = a.size
+            val fade = minOf(fadeLen, n / 2)
+            for (i in 0 until n) {
+                var gain = 1f
+                if (index > 0 && i < fade) gain = i.toFloat() / fade
+                if (index < segs.size - 1 && i >= n - fade) gain = (n - 1 - i).toFloat() / fade
+                out[pos + i] = (a[i] * gain).toInt().toShort()
+            }
+            pos += n
+        }
+        return out
+    }
+
+    /** Encodes mono 16-bit PCM to AAC-LC. Returns the track format and (PTS, data) packets */
+    private fun encodeAac(pcm: ShortArray): Pair<MediaFormat, List<Pair<Long, ByteArray>>>? {
+        val format = MediaFormat.createAudioFormat(
+            MediaFormat.MIMETYPE_AUDIO_AAC, AudioCapture.SAMPLE_RATE, 1
+        ).apply {
+            setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
+            setInteger(MediaFormat.KEY_BIT_RATE, AUDIO_BITRATE)
+            setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384)
+        }
+        val enc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+        val packets = mutableListOf<Pair<Long, ByteArray>>()
+        var outFormat: MediaFormat? = null
+        try {
+            enc.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            enc.start()
+            val info = MediaCodec.BufferInfo()
+            var inPos = 0
+            var inputDone = false
+            while (true) {
+                if (!inputDone) {
+                    val inIndex = enc.dequeueInputBuffer(10_000)
+                    if (inIndex >= 0) {
+                        val buf = enc.getInputBuffer(inIndex)!!
+                        buf.clear()
+                        val n = minOf(pcm.size - inPos, buf.remaining() / 2)
+                        val ptsUs = inPos * 1_000_000L / AudioCapture.SAMPLE_RATE
+                        if (n <= 0) {
+                            enc.queueInputBuffer(inIndex, 0, 0, ptsUs, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                            inputDone = true
+                        } else {
+                            buf.order(java.nio.ByteOrder.nativeOrder()).asShortBuffer().put(pcm, inPos, n)
+                            enc.queueInputBuffer(inIndex, 0, n * 2, ptsUs, 0)
+                            inPos += n
+                        }
+                    }
+                }
+                val outIndex = enc.dequeueOutputBuffer(info, 10_000)
+                if (outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    outFormat = enc.outputFormat
+                } else if (outIndex >= 0) {
+                    if (info.size > 0 && info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
+                        val buf = enc.getOutputBuffer(outIndex)!!
+                        buf.position(info.offset)
+                        buf.limit(info.offset + info.size)
+                        val data = ByteArray(info.size)
+                        buf.get(data)
+                        packets.add(info.presentationTimeUs to data)
+                    }
+                    enc.releaseOutputBuffer(outIndex, false)
+                    if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) break
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "AAC encoding failed", e)
+            return null
+        } finally {
+            runCatching { enc.stop() }
+            enc.release()
+        }
+        Log.i(TAG, "AAC encoded ${pcm.size} samples into ${packets.size} packets")
+        return outFormat?.let { it to packets }
     }
 
     // -----------------------

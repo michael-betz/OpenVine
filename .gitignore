@@ -16,3 +16,4 @@ local.properties
 *.jks
 release.sh
 keystore.properties
+.kotlin
